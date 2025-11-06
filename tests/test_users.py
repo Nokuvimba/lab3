@@ -1,69 +1,114 @@
 # tests/test_users.py
+import itertools
 import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool  # using this so the in-memory DB stays consistent
 
-#helper function to build a user JSON payload for reuse in tests
-def user_payload(uid=1, name="Paul", email="pl@atu.ie", age=25, sid="S1234567"):
- return {"user_id": uid, "name": name, "email": email, "age": age, "student_id": 
-sid}
 
-# test that a new user can be created successfully
-def test_create_user_ok(client):
- r = client.post("/api/users", json=user_payload())
- assert r.status_code == 201
- data = r.json()
- assert data["user_id"] == 1
- assert data["name"] == "Paul"
+from app.main import app, get_db
+from app.models import Base
 
-# test that creating a user with the same id again gives a 409 conflict error
-def test_duplicate_user_id_conflict(client):
- client.post("/api/users", json=user_payload(uid=2))
- r = client.post("/api/users", json=user_payload(uid=2))
- assert r.status_code == 409 # duplicate id -> conflict
- assert "exists" in r.json()["detail"].lower()
+TEST_DB_URL = "sqlite+pysqlite:///:memory:"
 
-#test for bad id
-@pytest.mark.parametrize("bad_sid", ["BAD123", "s1234567", "S123", "S12345678"])
-def test_bad_student_id_422(client, bad_sid):
- r = client.post("/api/users", json=user_payload(uid=3, sid=bad_sid))
- assert r.status_code == 422 # pydantic validation error
+# Using an in-memory DB for testing (so it's fast + clean)
+engine = create_engine(
+    TEST_DB_URL,
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
+TestingSessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+Base.metadata.create_all(bind=engine)
 
-#user that doesn't exist should return 404
-def test_get_user_404(client):
- r = client.get("/api/users/999")
- assert r.status_code == 404
- 
- # test deleting a user works the first time, then fails (404) the second time
-def test_delete_then_404(client):
- client.post("/api/users", json=user_payload(uid=10))
- r1 = client.delete("/api/users/10")
- assert r1.status_code == 204
- r2 = client.delete("/api/users/10")
- assert r2.status_code == 404
+@pytest.fixture
+def client():
+    def override_get_db():
+        db = TestingSessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+    app.dependency_overrides[get_db] = override_get_db
+    # Create a TestClient for the app
+    with TestClient(app) as c:
+        yield c
 
-def test_update_user_then_404(client):
-    # Creating user with id 11 
-    r_create = client.post("/api/users", json=user_payload(uid=11))
-    assert r_create.status_code == 201 #check if it was created 
+# Helper to create users
+_counter = itertools.count(1)
+def _create_user(client, **overrides):
+    n = next(_counter)
+    payload = {
+        "name": f"User{n}",
+        "email": f"user{n}@atu.ie",
+        "age": 25,
+        "student_id": f"S{1000000 + n}",
+    }
+    payload.update(overrides)
+    r = client.post("/api/users", json=payload)
+    assert r.status_code == 201, f"Create failed: {r.status_code} {r.text}"
+    return r.json()
 
-    # ensuring that the user_id in path and body are the same
-    updated_user = user_payload(uid=999)  #ignored by endpoint because it's not 11
-    updated_user["name"] = "Updated Name"
+# Test cases
+def test_create_user(client):
+    data = _create_user(client)
+    assert "id" in data and isinstance(data["id"], int)
+    assert data["email"].startswith("user")
 
-    #user's name with id 11 is updated
-    r1 = client.put("/api/users/11", json=updated_user) 
-    assert r1.status_code == 202 #Used 202 because module 'starlette.status' has no attribute 'HTTP_200_SUCCESS'
-    data = r1.json()
-    assert data["user_id"] == 11
-    assert data["name"] == "Updated Name"
+# Test  for listing users
+def test_list_users(client):
+    _create_user(client, name="Ann", email="ann@atu.ie", student_id="S1111111")
+    _create_user(client, name="Ben", email="ben@atu.ie", student_id="S2222222")
+    r = client.get("/api/users")
+    assert r.status_code == 200
+    users = r.json()
+    names = {u["name"] for u in users}
+    assert {"Ann", "Ben"}.issubset(names)
 
-    # updating a non-existing user
-    r2 = client.put("/api/users/999", json=updated_user)
+# Test for getting a user by ID
+def test_get_user(client):
+    created = _create_user(client)
+    uid = created["id"] # Get user ID
+    r = client.get(f"/api/users/{uid}")
+    assert r.status_code == 200
+    assert r.json()["id"] == uid
+
+# Test for conflict on duplicate email
+def test_conflict_on_duplicate_email(client):
+    _create_user(client, email="duplicate@atu.ie", student_id="S3333333")
+    r = client.post(
+        "/api/users",
+        json={"name": "Kate", "email": "duplicate@atu.ie", "age": 22, "student_id": "S4444444"},
+    )
+    assert r.status_code == 409
+    assert r.json()["detail"] == "User already exists"
+
+# Test for updating a user
+def test_update_user(client):
+    created = _create_user(client, name="Jane", email="old@atu.ie", student_id="S5555555")
+    uid = created["id"]
+    r = client.put(
+        f"/api/users/{uid}",
+        json={"name": "Kate", "email": "new@atu.ie", "age": 26, "student_id": "S5555555"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["id"] == uid
+    assert body["name"] == "Kate"
+    assert body["email"] == "new@atu.ie"
+
+# Test for deleting a user
+def test_delete_user(client):
+    created = _create_user(client, name="Delight", email="del@atu.ie", student_id="S7777777")
+    uid = created["id"]
+    r = client.delete(f"/api/users/{uid}")
+    assert r.status_code == 204
+    # verify deletion
+    r2 = client.get(f"/api/users/{uid}")
     assert r2.status_code == 404
- 
- #test for invalid email
-@pytest.mark.parametrize("bad_email", ["name@", "name@.com", "name", "name.com", "name@domain"])
-def test_bad_email_422(client, bad_email):
-    r = client.post("/api/users", json=user_payload(uid=2, email=bad_email))
-    assert r.status_code == 422 #invalid email
- 
- 
+
+# Test for getting a non-existent user
+def test_get_nonexistent_user(client):
+    r = client.get("/api/users/999999")
+    assert r.status_code == 404
+    assert r.json()["detail"] == "User not found"

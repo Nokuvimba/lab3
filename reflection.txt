@@ -1,0 +1,6 @@
+#Why do we separate database models from Pydantic schemas?
+
+- Why do we separate database models from Pydantic schemas?
+- What does SQLAlchemy’s Session do for us?
+- Why is it useful to have a Makefile instead of long commands?
+- What’s the benefit of testing with an in-memory database?

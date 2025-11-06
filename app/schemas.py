@@ -1,9 +1,20 @@
+from typing import Annotated
+from pydantic import BaseModel, EmailStr, Field, StringConstraints, ConfigDict
 
-from pydantic import BaseModel, EmailStr, constr, conint
+NameStr = Annotated[str, StringConstraints(min_length=2, max_length=50)]
+StudentId = Annotated[str, StringConstraints(pattern=r"^S\d{7}$")]
 
-class User(BaseModel):
-    user_id: int
-    name: constr(min_length=2, max_length=50)
+class UserCreate(BaseModel):
+    name: NameStr
     email: EmailStr
-    age: conint(gt=18)
-    student_id : constr(pattern=r'^S\d{7}$') # Student ID must start with 'S' followed by 7 digits
+    age: int = Field(gt=18)
+    student_id: StudentId
+
+class UserRead(BaseModel):
+    id: int
+    name: NameStr
+    email: EmailStr
+    age: int
+    student_id: StudentId
+
+    model_config = ConfigDict(from_attributes=True)
